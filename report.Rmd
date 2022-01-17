@@ -579,10 +579,10 @@ all_entries <- all_entries %>%
 
 ```{r Save/Read_data, eval=F, echo=F}
 #Save data into local file
-#write.csv(all_entries, "../Data/all_entries.csv", row.names = F)
+#write.csv(all_entries, "Data/all_entries.csv", row.names = F)
 
 #Read data from local file
-#all_entries <- read_csv("../Data/all_entries.csv")
+#all_entries <- read_csv("Data/all_entries.csv")
 ```
 
 ## Wikipedia variables
