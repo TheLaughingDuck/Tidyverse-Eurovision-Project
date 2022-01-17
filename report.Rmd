@@ -1,0 +1,795 @@
+---
+title: "Tidyvision: Hard R Hallelujah"
+author: "Simon Jorstedt (@TheLaughingDuck)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 2
+---
+
+```{r Start_time, echo=F}
+#For observing the total compile time
+global_start <- Sys.time()
+```
+
+# Abstract
+Using Webscraping and API requests, I aquire 14 particularly interesting variables of data for all Eurovision Song Contest entries since 1956. Then I study their distributions and display the results.
+
+# Introduction
+The Eurovision Song Contest (ESC) was created in 1956, as a way to promote cooperation between the countries of Europe, after WWII. It has been held every year since then (except in 2020) and has gone through a lot of change over time. The general concept is that participating countries each select a contestant, usually through a national competition (e.g. Melodifestivalen), that moves on to compete in the ESC. Then the contestants compete in two semifinals which eliminate all but 20 countries. Traditionally, the big five (France, Germany, Italy, Spain, the UK) and the host country are automatically qualified to the Grand final in which the 26 countries compete. Points are awarded by both national juries and public televoting.
+
+In this project, I have focused mainly on the musical features and qualities of the contributions, how they compare, potential changes over time etc. Further analysis on this subject could involve obtaining the awarded points, and analyse national voting trends and potential voting blocks.
+
+## Disclaimers and special cases
+Over the competitions history, Europe has changed a lot, which is reflected in the participating countries. Here are some selected disclaimers and special cases.
+
+* In line with the ESC [website](https://eurovision.tv/), this report will treat the entries from West Germany (until 1990) and the unified Germany (from 1991) as the same country: Germany. East Germany did not participate in the ESC.
+
+* In the first year of the contest (1956), seven countries participated, each contributing two entries. Each entry is counted as a distinct entry, but both entries are counted as a single entry for that country.
+
+* In 1956, only the winning entry was announced. Because of this, all the other entries will be considered sharing the second place.
+
+# Data: The Gathering
+```{r Packages, message=F, echo=F}
+#Tidyverse and data gathering
+library(tidyverse)
+library(httr)
+library(jsonlite)
+library(rvest)
+
+#String handling
+library(rebus)
+library(stringi)
+
+#Plot arrangement
+library(gridExtra)
+```
+
+The ESC's own [website](https://eurovision.tv/), although stylish, is not friendly for data collection, barely even webscraping. Neither is the **privately** run ESC "database" (quite contradictory) available [here](https://eschome.net/). Instead, I have shifted my focus to wikipedia. Luckily the pages I will be using reference the ESC's website as source.
+
+We are also going to be using the spotify API ([documentation reference here](https://developer.spotify.com/documentation/web-api/reference/#/)) to get certain audio features that Spotify provides on its tracks. The audio features can however only be obtained by requesting them using a tracks Spotify-specific ID. The IDs in turn can be extracted if the list of relevant songs is connected to, or on Spotify. Since this is not our case, we will instead have to use the APIs search endpoint.
+
+## Wikipedia webscraping
+All of the 1603 entries can be found on [this (1956-2003)](https://en.wikipedia.org/wiki/List_of_Eurovision_Song_Contest_entries_(1956%E2%80%932003)) and [this (2004-2021)](https://en.wikipedia.org/wiki/List_of_Eurovision_Song_Contest_entries_(2004%E2%80%93present)) page, both containing one table for each year. The information is divided this way because in 2004, semifinals were introduced. This means that the 2004-2021 tables have an additional column indicating semifinal running order.
+
+The available columns in these tables are 
+
+* Entry Number: The order of appearance in the contest. Uniquely identifies every song that has participated.
+
+* Country Entry Number: The order of appearance among each countrys contributions. For example, "Zitti e Buoni" (2021) has the Country Entry Number 46, because it was Italys 46th contribution in the contest.
+
+* Running order (semifinal): Indicating in which order a song was performed in it's semifinal.
+
+* Running order (final): Indicating in which order a song was performed in the Grand final.
+
+* Placing: Relative placing. 1 indicates the winner. In later years, a series of symbols like "DNQ", "◁" and "†" are used to indicate placing in the semifinal and final (all in the same column...).
+
+Additionally, there are columns for Country, Artist, Song, Songwriters and Language, which requires no further explanation.
+
+The following code chunk contains two main pipelines, one for each of the wikipedia pages. They are slightly different (because the pages are) but essentially do the same thing. They use rvest functions to webscrape the wikipedia pages html files, extract the relevant columns, and filter out any other columns. Then they go through an intricate process of initial cleaning of their columns and appropriate renaming. Finally they are combined, and the Song and Artist columns are cleaned by removing quotation marks, alternative titles and references/links (e.g. [is]).
+
+```{r Webscraping base data}
+#Webscraping 1956-2003, 2004-2021 from wikipedia
+
+##Setup
+site1_url <- "https://en.wikipedia.org/wiki/List_of_Eurovision_Song_Contest_entries_(1956%E2%80%932003)"
+site2_url <- "https://en.wikipedia.org/wiki/List_of_Eurovision_Song_Contest_entries_(2004%E2%80%93present)"
+years_1 <- c(1956:2003)
+years_2 <- c(2004:2019, 2021)
+
+
+
+##Processing years 1956-2003
+table1956 <- site1_url %>% 
+  #Webscraping
+  read_html() %>% 
+  html_nodes(css="table") %>% 
+  html_table() %>% 
+  
+  #Data cleaning and tidying
+  
+  ##Removing extra tables
+  keep(.p=~ncol(.x)==9) %>% 
+  
+  ##Changes needed to be able to handle the dataframes
+  map(.f=~rename(.data = .x, EntryNum = "#")) %>% 
+  map(.f=~rename(.data = .x, EntryNumCountry = "#")) %>% 
+  map2(.y=years_1, .f=~mutate(.x, year = .y)) %>% 
+  
+  ##Changing Country Entry Number from "1 (1)" and "1 (2)" to 1 in 1956
+  map_if(.f=~mutate(.x, EntryNumCountry = 1), .p=~.x$year[1] == 1956) %>% 
+  
+  ##Column "Placing" in 1956 has a citation: [a]. (from webscraping)
+  map_if(.f=~rename(.x, Placing = "Placing[a]"), .p=~names(.x)[9] == "Placing[a]") %>% 
+  
+  ##Merging all tables
+  bind_rows() %>% 
+  
+  ##Changing Placing from N/A to 2 in 1956
+  mutate(Placing = ifelse(Placing == "N/A" & year==1956,
+                          2,
+                          Placing)) %>% 
+  
+  ##Removing "last place" character from Placing column
+  ##Converting to integer
+  mutate(Placing = str_extract(Placing, pattern = DGT %R% optional(DGT)) %>% 
+           as.integer()) %>% 
+  
+  ##Fixing Running order (R/O) columns
+  ##This is still very confusing
+  rename("Running_order_F" = `R/O`) %>% 
+  mutate("Running_order_SF" = as.integer(NA))
+  
+
+
+##Processing years 2004-2021
+table2004 <- site2_url %>% 
+  #Webscraping
+  read_html() %>% 
+  html_nodes(css="table") %>% 
+  html_table() %>% 
+  
+  #Data cleaning and tidying
+  
+  ##Remove extra tables
+  keep(.p=~ncol(.x)==10) %>% 
+  
+  ##Changes needed to be able to handle the dataframes
+  map(.f=~rename(.data = .x, EntryNum = "#")) %>% 
+  map(.f=~rename(.data = .x, EntryNumCountry = "#")) %>% 
+  map2(.y=years_2, .f=~mutate(.x, year = .y)) %>% 
+  
+  ##Merging all tables
+  bind_rows() %>% 
+  
+  ##Cleaning Placing column from "DNQ" etc
+  mutate(Placing = str_extract(Placing,
+                               pattern=DGT %R% optional(DGT)) %>% as.integer()) %>% 
+  
+  ##Fixing/Cleaning R/O columns
+  rename("Running_order_SF" = `R/O SF`,
+         "Running_order_F" = `R/O F`) %>% 
+  mutate(Running_order_SF = ifelse(Running_order_SF=="N/A",
+                                   NA,
+                                   Running_order_SF),
+         Running_order_F = ifelse(Running_order_F=="N/A",
+                                  NA,
+                                  Running_order_F) %>% as.integer()) %>% 
+  
+  ##Changing R/O column type
+  mutate(Running_order_SF = str_extract(Running_order_SF,
+                                        pattern=DGT %R% optional(DGT)) %>% as.integer())
+
+
+
+##Merging the two large tables
+all_entries <- bind_rows(table1956, table2004) %>% 
+  
+  #Clean Song, and then Artist column
+  ##Remove quotation marks, alternative titles
+  ##Example "\"Pia prosefhi\" (Ποια προσευχή)"
+  mutate(stop = map_dbl(.x=str_locate_all(Song, pattern="\""), .f=~.x[2]-1)) %>% 
+  mutate(Song = str_sub(Song, start=2, end=stop)) %>% 
+  select(-stop) %>% 
+  
+  #Clean artist column
+  #Successful!
+  mutate(Artist = str_remove_all(Artist,
+                                 pattern = SPACE %R% 
+                                   "\\[" %R% WRD %R% WRD %R% "\\]" %R% 
+                                   optional(SPACE)))
+
+
+#Looking for join issues (both should be TRUE)
+#nrow(all_entries) == nrow(table1956) + nrow(table2004)
+#ncol(all_entries) == ncol(table2004) #or table1956
+```
+
+The entry that got last place is identified in the Placing column by the last number, and the symbol "◁". I will simply remove that symbol with `str_extract`. Similarly in the 2004-2021 tables, there are a lot of extra informative symbols in the Placing column. These include "DNQ" indicating that the entry did not qualify for the final, and crosses which are weird. We remove them with `str_extract` again.
+
+Next, we want to have a go at obtaining the songs genres. Unfortunately, genre is not indicated in the wikipedia tables, however, it is on *some* of the individual songs pages. Wikipedia pages typically have an infobox, which for songs sometimes contains Genre. An example is "[Waterloo](https://en.wikipedia.org/wiki/Waterloo_(ABBA_song))" (1974). Next, we have to figure out the URLs. Here, I discovered that the page URLs come in a systematic pattern. First there is the "base_url" of "en.wikipedia.org/wiki/", followed by either "Songname" or "Songname_(Artist_song)" depending on whether or not Songname is something that already exist. For example "Sugar_(Natalia_Gordienko_song)", since "Sugar" already is taken. Using this knowledge I was able to build the function `Scrape_genre` in the chunk below which combines the URLs in this way, and tries webscraping first the long one, and then the short one. For this I used a nested `tryCatch()`. If the URL works, and the page has Genre, it is extracted and returned.
+
+```{r Scrape_genre(), warning=F}
+base_url_scrapegenre <- "https://en.wikipedia.org/wiki/"
+
+Scrape_genre <- function(Song, Singer){
+  
+  ##Create url-worthy strings
+  Song <- str_replace_all(Song, pattern=" ", replacement = "_")
+  Singer <- str_replace_all(Singer, pattern=" ", replacement = "_") %>% 
+    paste("_(", ., "_song)", sep="")
+  
+  
+  ##Create url attempts
+  url1 <- paste(base_url_scrapegenre, Song, sep="") #Try this second
+  url2 <- paste(url1, Singer, sep="") #Try this first
+  
+  ##Attempt to read_html
+  infobox <- tryCatch(read_html(url2) %>% 
+                        html_node(css=".infobox") %>% 
+                        html_table(),
+                      
+     error = function(cond){tryCatch(read_html(url1) %>% 
+                        html_node(css=".infobox") %>% 
+                        html_table(),
+                        
+     error = function(cond){return("E_url")})
+       }
+     )
+  
+  ##error handling: url
+  if(infobox == "E_url"){return("E_url")}
+  
+  ##Assign column names
+  colnames(infobox) <- c("Key", "Value")
+  
+  ##Check if has page has genre
+  if(! "Genre" %in% infobox$Key){
+    return("E_nogenre")
+  }
+  
+  ##All clear: extract genre
+  infobox <- infobox %>% 
+    select(Key, Value) %>% 
+    filter(Key == "Genre")
+  
+  #Get the "Value" that corresponds to the key "Genre"
+  infobox$Value[1]
+}
+```
+
+We can then take our already existing data frame `all_entries` which contain Song and Artist, and iterate through it with `map2_chr()` to extract Genre, using the previous `Scrape_genre` function. The reason we need to iterate through all songs, and can't just send the Song and Artist columns into `Scrape_genre()`, is that the webscraping functions don't accept vectors of URLs as input.
+
+```{r Apply Scrape_genre(), warning=F, echo=F}
+#This chunk has long compile time (expect at the most 30 min)
+
+#Iterate through all songs and scrape genre
+all_entries <- all_entries %>% 
+  mutate(Genre = map2_chr(.x=.$Song, .y=.$Artist, .f=~Scrape_genre(.x, .y)))
+
+##Suppressing warnings, because of "error handling: url" in Scrape_genre.
+##Warnings are thrown when infobox has length > 1 and is compared with "E_url".
+##However, when this is the case, the webscraping was successful, and the
+##warning is thus uneccessary.
+```
+
+In figure 1 below, we see the number of songs by genre after they have been scraped. In addition to these, there are 259 "unique" genres, which have not been cleaned for want of time. They mainly consist of different kinds of Pop, and some Rock. Regardless of that, we see that there still are a lot of songs whose page either didn't have genre ("E_nogenre"), or had another type of URL than the two alternatives discussed earlier ("E_url"). A great example of how the genre scraping made a mistake is the song "[Jack in the Box](https://en.wikipedia.org/wiki/Jack_in_the_Box_(song))" (1971). The [fast food restaurant](https://en.wikipedia.org/wiki/Jack_in_the_Box) chain with the same name in fact has a specified genre: "Fast food", which the genre scraping extracted and assigned to the song.
+
+```{r Figure 1: Top 5 Genres, echo=F}
+all_entries %>% 
+  count(Genre, sort = T, name = "Count") %>% 
+  head(5) %>% 
+  knitr::kable(caption="Figure 1: Top 5 Webscraped genres")
+```
+
+The songs that are missing Genre are the most frequent in the early contests (up till around 2000), possibly because wikipedia wasen't launched until after this. This is shown in figure 2 below. All genres that are not "E_nogenre" or "E_url" are grouped into "Specified". Note the slow incline in Total songs, and then the almost doubling in the 2000s. The number of songs with specified genre also increase radically. The songs with "E_url" are steadily few through the years of the contest, indicating that it is due to esssentially randomness, e.g. unsystematic wikipedia page names, unexisting pages etc.
+
+```{r Figure 2: Number of songs by Genre Category, echo=F}
+all_entries %>% 
+  mutate(Genre = ifelse(Genre %in% c("E_nogenre", "E_url"), Genre, "Specified")) %>% 
+  select(year, Genre) %>% 
+  count(year, Genre) %>% 
+  pivot_wider(names_from = Genre, values_from = n, values_fill = 0) %>% 
+  mutate(Total = E_nogenre + E_url + Specified) %>% 
+  
+  pivot_longer(cols = c("E_nogenre", "E_url", "Specified", "Total"),
+               names_to = "Categories",
+               values_to = "Count") %>% 
+  
+  ggplot(aes(year, Count, col=Categories)) +
+  geom_line() +
+  labs(title = "Figure 2: Number of songs per Genre category over time") +
+  xlab("Year") +
+  ylab("Number of songs")
+```
+
+## The Spotify API
+Spotifys API is free to use. Unfortuantely it's a bit of a hassle to get access to. First we create a developer "app" on Spotifys developer site. It provides us with user credentials: a personal client ID and a Secret Key. These credentials are hidden, and called from a .Renviron file not uploaded with the project. The credentials can in turn be used with a POST request to the app to aquire an access token. Access tokens are then used in requests. In the chunk below the `aquire_token` function performs this POST request. The chunk also contains some base URLs, representing endpoints, that will be used to construct longer, more specific requests later.
+
+```{r Aquire Access token}
+#Aquire access token (Spotify API)
+
+##Function for requesting access token
+aquire_token <- function(){
+  ##Request access token
+  response <- POST(post_url,
+     config=authenticate(user=Sys.getenv("SPOTIFY_ID"),
+                         password = Sys.getenv("SPOTIFY_KEY")),
+     body=list(grant_type="client_credentials"),
+     encode="form")
+  
+  ##Format/Extract access token
+  token<-content(response)
+  paste(token$token_type, token$access_token) %>% return()
+}
+
+
+#Base URLs
+
+##URL for access token request
+post_url = "https://accounts.spotify.com/api/token"
+
+##URL for searching track. Append "&p=" etc
+base_url_search <- "https://api.spotify.com/v1/search?type=track&limit=1"
+
+##URL for aquiring audio-features. Append id, with nothing else
+base_url_features <- "https://api.spotify.com/v1/audio-features/"
+```
+
+Now that we can aquire access tokens, we can move on to the requests themselves. For the purposes of this, I have built a client, called `get_tracks`, which takes up the majority of the next chunk. The client takes an endpoint and an additional string, combines them, and attempts to make a request to the API. If the request is successful, it goes through a series of error handling statements. These are particularly important because we will be iterating through all of the 1603 songs, and we can't have the program break because *one* song is incompatible. This is also why I introduced the `out_message`, a string that let's me create custom error messages, and output it at the end. When the function is done with the error handling, it formats the aquired content, and returns a list with the formated content, and the `out_message`.
+
+```{r Spotify client}
+#Spotify client
+get_tracks <- function(endpoint, additional){
+  #`get_tracks()` takes `endpoint`, and an `additional` string, and attempts
+  #to make a GET request with the combined url. Then after error handling
+  #it outputs the desired data.
+  #output comes in a list with two elements: content, and an out_message,
+  #which potentially says something about how the function worked.
+  #If out_message is empty, the function likely worked with no issues.
+  
+  ##Black box message string
+  out_message = ""
+  
+  ##Unknown rate limit (but measured against 30seconds)
+  Sys.sleep(0.1)
+  
+  #GET request
+  url <- paste(endpoint, additional, sep="")
+  
+  email <- paste("jors", "tedtsimon", "@", "gmail.com", sep="")
+  
+  ##Attempt GET request
+  response <- tryCatch(GET(url, user_agent(email),
+                  config=add_headers(Authorization=bearer.token)),
+                  
+                  error=function(cond){
+                    return("FAIL")
+                  })
+  
+  
+  #Error handling
+  if(response == "FAIL"){
+    out_message = "Error_in_url"
+    return(list("absent_content", out_message))
+  }
+  if(http_error(response)){
+    out_message = paste("Error_http_status: ", http_status(response), sep="")
+    return(list("absent_content", out_message))
+  }
+  if(http_type(response) != "application/json"){
+    out_message = paste(out_message, "Error_response_file_type", sep="&")
+    return(list("absent_content", out_message))
+  }
+  if(response$status_code == 429){
+    out_message="Error_ratelimit"
+    return(list("absent_content", out_message))
+  }
+  if(response$status_code == 401){
+    out_message="Error_accesstoken_expired"
+    return(list("absent_content", out_message))
+  }
+  
+  
+  ##Formatting and return
+  response <- fromJSON(content(response, as="text"))
+  return(list(response, out_message))
+}
+```
+
+The next step is to aquire the Spotify-specific IDs. For this purpose I've built a wrapper around the client `get_tracks` called `ID_wrapper` in order to additionaly prepare requests, and deal with errors that come up. Part of this is done with the `transliterate` function, which we will get to shortly. The wrapper essentially takes a Song title and an Artist, cleans them from difficult characters, puts them together in a way that the API understands, and sends them to `get_tracks` to make a request. The additional error handling is meant to catch errors and deal with the response if it contains no tracks. Finally a bit of formating extracts the title, artist, and ID of the top track suggested by Spotify. The title and artist are relevant here, because of the risk of getting the wrong track.
+
+```{r ID_wrapper(), warning=F}
+ID_wrapper <- function(song, artist){
+  
+  ##Transliterate to remove/convert certain characters,
+  ##that are not accepted by the API.
+  song <- transliterate(song)
+  artist <- transliterate(artist)
+  
+  
+  #Search query information, assemble!
+  query <- paste("&q=artist:",
+                 str_replace_all(artist, pattern=" ", replacement="%20"),
+                 "+track:",
+                 str_replace_all(song, pattern=" ", replacement="%20"),
+                 sep="")
+  
+  
+  #GET Request
+  response <- get_tracks(base_url_search, query)
+  
+  #Error handling
+  if(response[[2]] != ""){
+    print("Error detected in ID_wrapper()")
+    return(response)
+  }
+  if(length(response[[1]]$tracks$items) == 0){
+    response <- list(title=NA, artist=NA, id=NA)
+    return(list(response, "Error_no_tracks"))
+  }
+  
+  meta <- response[[1]]$tracks$items %>% 
+    mutate(artist = map(.x=artists, .f=~.x$name) %>% 
+                    map_chr(.f=~str_c(.x, collapse="&"))) %>% 
+    rename("title" = name) %>% 
+    select(title, artist, id)
+  
+  return(list(meta[1,], response[[2]]))
+}
+```
+
+The previously mentioned `transliterate`function is essential, especially in the context of Eurovision, where the participating countries use a wide variety of alphabets. The spotify API on the other hand only seems to accept characters in the Latin alphabet and various other non-letter characters. The `transliterate` function therefore is built to identify the unicode encoding of a large number of characters, and replace them with an appropriate Latin variant. As an example, it would take "Símõň JörŠťëðť", and turn it into Simon Jorstedt". I would like to stress that I tried looking for a prebuilt function for this purpose (for example `iconv`) but it failed to provide the full required functionality. The function is not shown below, because it just consists of a lot of similarly looking `gsub()` statements.
+
+```{r transliterate(), echo=F}
+transliterate <- function(string){
+  string %>% 
+    #Trial function to convert away characters that are wrongly encoded
+    stri_unescape_unicode() %>% 
+    
+    gsub(pat=dash, rep="-") %>% 
+    gsub(pat=A, rep="a") %>% 
+    gsub(pat=AE, rep="ae") %>% 
+    gsub(pat=C, rep="c") %>% 
+    
+    gsub(pat=D, rep="d") %>% 
+    gsub(pat=E, rep="e") %>% 
+    gsub(pat=G, rep="g") %>% 
+    gsub(pat=H, rep="h") %>% 
+    
+    gsub(pat=I, rep="i") %>% 
+    gsub(pat=L, rep="l") %>% 
+    gsub(pat=N, rep="n") %>% 
+    gsub(pat=O, rep="o") %>% 
+    gsub(pat=OE, rep="oe") %>% 
+    
+    gsub(pat=S, rep="s") %>% 
+    gsub(pat=SS, rep="ss") %>% 
+    gsub(pat=t, rep="t") %>% 
+    gsub(pat=TH, rep="th") %>% 
+    
+    gsub(pat=U, rep="u") %>% 
+    gsub(pat=Y, rep="y") %>% 
+    gsub(pat=Z, rep="z") %>% 
+    
+    #Additional characters (removed)
+    gsub(pat="[¿?¡!,.'-+…#%&%]", rep="") %>% 
+    
+    gsub(pat="[\u00a0]", rep=" ") %>% #Strange space, different from: " "
+    
+    ##Replacing very weird characters that somehow ended up in the columns
+    ##"Not everything is a lesson Ryan, sometimes your code just failes."
+    gsub(pat="[\ufffd\u663c\u3e33]", rep="?") %>% #�昼㸳
+    
+    return()
+}
+
+
+dash = "[\u2013]" #Weird dash: – , different from "regular" dash: -
+A = "[\u0103\u00e1\u00c1\u00e0\u00c0\u00e2\u00e3\u00c5\u00e5\u00c4\u00e4]" #a
+AE = "[\u00e6]" #æ
+C = "[\u0107\u010d\u010c\u0106\u00e7\u00c7]"
+D = "[\u0111\u010e\u00f0]"
+E = "[\u0117\u0119\u00e9\u00c9\u00e8\u00ea\u00eb]" #é
+G = "[\u011f]"
+H = "[\u0127]"
+I = "[\u0131\u012b\u0130\u00ed\u00ec\u00ee\u00ef\u0131]"
+L = "[\u0142\u0141]"
+N = "[\u0148\u0144\u00f1]"
+O = "[\u00f3\u00d3\u00f2\u00f5\u00f8\u00d8\u00d6\u00f6\uf3]"
+OE = "[\u0153]" #œ
+S = "[\u015f\u015b\u015e\u0161\u0160\u0219]"
+SS = "[\u00df\u1e9e]" #ß
+t = "[\u0165\u021b]"
+TH = "[\u00fe\u00de]" #þÞ
+U = "[\u00fa\u00da\u00f9\u00fc\u00dc]"
+Y = "[\u00fd]"
+Z = "[\u017b\u017e\u017d]"
+```
+
+With all the required functions built and prepared, we now move on to making the requests. First we request an access token (which is valid for about 30 minutes) using the hidden credentials. Then we can start iterating and then extracting the title, artist and ID for every song. This is done in a hidden chunk below.
+
+```{r Applying ID_wrapper, warning=F, echo=F}
+#Requesting access token
+bearer.token = aquire_token()
+
+#Extracting ID from spotify
+all_entries <- all_entries %>% 
+  
+  ##Iterating through all songs, and then extracting the title, artist and ID.
+  mutate(meta = map2(.x=Song, .y=Artist, .f=~ID_wrapper(.x, .y))) %>% 
+  mutate(api.title = map_chr(meta, .f=~.x[[1]]$title),
+         api.artist = map_chr(meta, .f=~.x[[1]]$artist),
+         api.id = map_chr(meta, .f=~.x[[1]]$id)) %>% 
+  
+  
+  ##Check for wrong grabs
+  #mutate(check = Artist == api.artist & Song == api.title) %>% 
+  
+  ##Drop the check variables
+  select(-api.artist, -api.title, -meta)
+```
+
+This method is somewhat problematic, because the API will return the best result given a particular request, and this is not always going to be the right song. Because of this I inspected the "true" Song title and Artist from the wikipedia scraping with the aquired tracks. What I found from a couple of random samples was that there are in fact very few wrong grabs, and most of the tracks are correct. Besides these, there were also a lot of songs which the algorithm just failed to grab any ID for. In these cases the ID is entered as an NA. In total, 974 songs *do* have an ID, which means we still have a lot of observations to work with.
+
+The next and final step is to simply use the aquired IDs to request the songs audio features from Spotifys API. The URLs for these requests are made up of a base url, and the id, put together. In a following hidden chunk below we iterate through all songs using `map`, and then extract all the audio features from the returned dataframe. Note that the requests are made through a small wrapper function called `features_wrapper` (which is not shown) whose only purpose is to return all the audio features set to NA in case the ID for a song is missing. Otherwise it sends the ID to the same client used previously for ID requests. In the end of the chunk, some additional cleaning is done to aid the data handling/filtering in the next section where we visualise and analyse the data.
+
+```{r features_wrapper, echo=F}
+features_wrapper <- function(id){
+  
+  #Detect missing id
+  if(is.na(id) == T){
+    return(list(list(danceability=NA, energy=NA, key=NA,
+                     loudness=NA, mode=NA, speechiness=NA,
+                     acousticness=NA, instrumentalness=NA, liveness=NA,
+                     valence=NA, tempo=NA, time_signature=NA,
+                     duration_ms=NA),
+                message="E_missing_id")
+           )
+  }
+  
+  #Otherwise make request for audio features
+  get_tracks(base_url_features, id) %>% return()
+}
+```
+
+```{r Get audio features and clean data, warning=F, echo=F}
+all_entries <- all_entries %>% 
+  #Request audio features
+  mutate(audio_features = map(.x=api.id, .f=~features_wrapper(.x))) %>% 
+  
+  #Extract audio features
+  mutate(danceability = map_dbl(audio_features, .f=~.x[[1]]$danceability),
+         energy = map_dbl(audio_features, .f=~.x[[1]]$energy),
+         key = map_dbl(audio_features, .f=~.x[[1]]$key),
+         loudness = map_dbl(audio_features, .f=~.x[[1]]$loudness),
+         mode = map_dbl(audio_features, .f=~.x[[1]]$mode),
+         speechiness = map_dbl(audio_features, .f=~.x[[1]]$speechiness),
+         acousticness = map_dbl(audio_features, .f=~.x[[1]]$acousticness),
+         instrumentalness = map_dbl(audio_features, .f=~.x[[1]]$instrumentalness),
+         liveness = map_dbl(audio_features, .f=~.x[[1]]$liveness),
+         valence = map_dbl(audio_features, .f=~.x[[1]]$valence),
+         tempo = map_dbl(audio_features, .f=~.x[[1]]$tempo),
+         time_signature = map_dbl(audio_features, .f=~.x[[1]]$time_signature),
+         duration = map_dbl(audio_features, .f=~.x[[1]]$duration_ms),
+         
+         message = map_chr(audio_features, .f=~.x[[2]])) %>% 
+  
+  ##Drop audio_features (since they have been extracted)
+  select(-audio_features) %>% 
+  
+  
+  #Final cleaning
+  
+  ##Clean up character columns
+  mutate(Song = transliterate(Song),
+         Artist = transliterate(Artist),
+         Genre = transliterate(Genre),
+         
+         ##Duration from milliseconds to seconds
+         duration = duration/1000) %>% 
+  
+  ##Drop unneccessary columns
+  select(-api.id, -message)
+```
+
+# Discussion and Visualisation
+
+```{r Save/Read_data, eval=F, echo=F}
+#Save data into local file
+#write.csv(all_entries, "../Data/all_entries.csv", row.names = F)
+
+#Read data from local file
+#all_entries <- read_csv("../Data/all_entries.csv")
+```
+
+## Wikipedia variables
+The first couple of variables, obtained from the webscraping, contain some crucial information about the songs. Let's have a look at them, from the context of this report. Some of these variables are not very interesting and will be discarded. See the Appendix for the reasoning behind this. Three of the remaining ones are Language, Country and Year.
+
+```{r Figure 3: Language distribution by country, echo=F}
+#Extract the major languages
+major_langs <- all_entries %>% 
+  count(Language, sort=T) %>% 
+  filter(n > 40) %>% c()
+
+#Extract the major countries
+major_countries <- all_entries %>% 
+  count(Country, sort=T) %>% 
+  filter(n > 40)
+
+#Plot the Language distribution among the major countries
+all_entries %>% 
+  filter(Country %in% major_countries$Country) %>% 
+  
+  #Cleaning the Language variable
+  mutate(Language = transliterate(Language)) %>% 
+  mutate(Language = str_remove_all(Language, pat="\\[" %R% WRD %R% optional(WRD) %R% "\\]")) %>%
+  
+  #Categorising the Languages
+  mutate(Language = ifelse(Language %in% c("English", "French", "German"),
+                           Language,
+                           "Other/Multiple")) %>% 
+  
+  #Create plot
+  ggplot(aes(Country, fill=Language)) +
+  geom_bar() +
+  labs(title="Figure 3: Language distribution among some major countries",
+       subtitle = "Countries with more than 40 contributions.") +
+  xlab("") +
+  ylab("Number of songs") +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+```{r Figure 4: Language distribution over time, echo=F}
+#Plot the language distribution over time
+all_entries %>% 
+  filter(Country %in% major_countries$Country) %>% 
+  
+  #Cleaning the Language variable
+  mutate(Language = transliterate(Language)) %>% 
+  mutate(Language = str_remove_all(Language, pat="\\[" %R% WRD %R% optional(WRD) %R% "\\]")) %>%
+  
+  #Categorising the Languages
+  mutate(Language = ifelse(Language %in% c("English", "French", "German"),
+                           Language,
+                           "Other/Multiple")) %>% 
+  count(year, Language) %>% 
+  
+  #Create plot
+  ggplot(aes(year, n, col=Language)) +
+  geom_line() +
+  labs(title = "Fig 4: Language distribution over time") +
+  xlab("Year") +
+  ylab("Number of songs")
+```
+
+What we can see in Figure 3 is not very surprising (but still interesting!). English is clearly a common language in a lot of the participating countries. When examining the total distribution in all countries, English makes up at least 39% of all songs, followed by French with 10%, and German with 5%. The distribution is similar, but more extreme in the recent contests. In figure 4 we see that the frequency of English, French and German songs was very low in the beginning of the contest, but lately English has increased, becoming a dominant language. This is because contestants have only had complete "language freedom" since 1999. Before that, contestants were forced to sing in one of their national languages.
+
+## Audio Features
+Let us now take a look at the audio features, and what information they hold. Unfortunately we are going to have to discard some of them as well. See the Appendix for the reasoning behind this.
+
+The first audio features we are going to be looking at are the technical audio features. These contain information about the structure and musical backbone of a song, and are likely to be very interesting to a musician. The first one is Key, and indicates which pitch class the song is in. The second one is mode, or modality, indicating "the type of scale from which its melodic content is derived". It can be major (1) or minor (0) (sv: Dur eller Moll). The other two are tempo (BPM), and time signature which specifies how many beats are in each "bar". According to the documentation, the time signature ranges from 3 to 7, indicating signatures "3/4" to "7/4". The five songs assigned a time signature of 1 are assumed erroneus and are therefore removed.
+
+In figure 3 we see the distribution of these variables. The distribution of key is fairly even, but there are some interesting relationships between certain keys and their "neighbours". The modality is also interesing, and seemingly implies that "happy" songs are more frequent than "sad" songs. The bulk of the distribution of BPM is at about 125, with a lot of songs with lower values. But we also see that quite fast paced songs are not uncommon, with values ranging up to 200.
+
+```{r Figure 5: Technical audio features. Use for plots, echo=F}
+#This key for transforming the keys, is called keys
+keys <- c("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+#Plot distribution of key varible
+p1 <- all_entries %>% 
+  filter(is.na(key) != T) %>% 
+  mutate(key = as.factor(keys[key+1])) %>% 
+  
+  ggplot(aes(key)) +
+  geom_bar() +
+  labs(title="Key (ordered)") +
+  xlab("") +
+  ylab("Number of songs")
+
+#Plot distribution of mode varible
+p2 <- all_entries %>% 
+  filter(is.na(mode) != T) %>% 
+  mutate(mode = ifelse(mode == 1, "Major", "Minor") %>% as.factor()) %>% 
+  
+  ggplot(aes(mode)) +
+  geom_bar() +
+  labs(title="Modality") +
+  xlab("") +
+  ylab("Number of songs")
+
+
+#Plot distribution of temp varible
+p3 <- all_entries %>% 
+  filter(is.na(tempo) != T) %>% 
+  
+  ggplot(aes(tempo)) +
+  geom_histogram(bins=15) +
+  labs(title="Tempo (BPM)") +
+  xlab("") +
+  ylab("Number of songs")
+
+
+#Plot distribution of time_signature varible
+p4 <- all_entries %>% 
+  filter(is.na(time_signature) != T & time_signature != 1) %>% 
+  mutate(time_signature = as.factor(time_signature)) %>% 
+  
+  ggplot(aes(time_signature)) +
+  geom_bar() +
+  labs(title = "Time signature") +
+  xlab("") +
+  ylab("Number of songs")
+  
+#Combine plots
+grid.arrange(p1, p2, p3, p4, nrow=2, top="Figure 5: Technical audio features")
+```
+
+Finally, there are some really interesting variables, which have been invented and calculated by Spotify themselves. They all take values from 0 to 1 and measure how much something accours, or how much a song alings with a certain feature. The first one is Energy, and measures the "intense and activity" of a track. The second is Acousticness which indicates the "confidence" that a song is acoustic. For example, "Amar Pelos Dois" (2017) has acousticness value of `0.853000`, while "Hard Rock Hallelujah" (2006) has a value of `0.000516`. The next one is Valence, or "musical positiveness". Songs with high Valence "sound more positive (e.g. happy, cheerful, euphoric)" while songs with low valence sound more negative, sad, depressed. Ironically, "Euphoria" (2012) has a low Valence value of `0.106`. Finally, we have the gold nugget of Danceability. The higher the value, the more suitable it is for dancing. The highest scoring song? Unsurprisingly achieved in the 80s by Plastic Bertrand with "Amour Amour" (1987), scoring `0.914`! The distribution of these variables is displayed in figure 6 below.
+
+```{r Figure 6: Distributions of Audio Features, echo=F}
+#Distribution of Energy
+p1 <- all_entries %>% 
+  filter(is.na(energy) != T) %>% 
+  ggplot(aes(energy)) +
+  geom_histogram(bins=15) +
+  labs(title="Energy") +
+  xlab("") +
+  ylab("Number of songs")
+
+#Distribution of Acousticness
+p2 <- all_entries %>% 
+  filter(is.na(acousticness) != T) %>% 
+  ggplot(aes(acousticness)) +
+  geom_histogram(bins=15) +
+  labs(title="Acousticness") +
+  xlab("") +
+  ylab("Number of songs")
+
+#Distribution of Valence
+p3 <- all_entries %>% 
+  filter(is.na(valence) != T) %>% 
+  ggplot(aes(valence)) +
+  geom_histogram(bins=15) +
+  labs(title="Valence") +
+  xlab("") +
+  ylab("Number of songs")
+
+#Distribution of Danceability
+p4 <- all_entries %>% 
+  filter(is.na(danceability) != T) %>% 
+  ggplot(aes(danceability)) +
+  geom_histogram(bins=25) +
+  labs(title="Danceability") +
+  xlab("") +
+  ylab("Number of songs")
+
+#Combine plots
+grid.arrange(p1, p2, p3, p4, nrow=2, top="Figure 6: Distributions of Audio Features")
+```
+
+In figure 6 we see some interesting results. It appears that songs generally are energetic and intense, and additionaly very few songs score low Energy values. The distribution of Acousticness implies that there is a lot of variation, with a bulk of low values, but also many high values. Valence is quite uniform, but it appears that songs tend to avoid the absolutely lowest values, representing really sad/depressed songs. Danceability, just like Energy, show a high-leaning distribution of many happy/dance-friendly songs, although there is a lot of variation with values in both extremes.
+
+# Appendix
+
+## Discarded Wikipedia variables
+The EntryNumber is essentially a unique identifier, which is not very relevant since we already have Song title and Artist. The EntryNumberCountry is similarly merely a counter of the number of contributions by country, which can easily be counted without it. The running order is not very interesting either, because up until 2012 it was random, and since then it is determined by the producers to avoid having similar songs perform in sequence. The last variable to be tossed is Songwriters. It is an interesting aspect of the songs, which could be relevant in an analysis of the individual people involved. But it does not quite make the cut on contributing  useful information about the songs properties.
+
+## Discarded Audio Features
+Speechiness (values 0-1) measures the presence of *spoken* words, like "talk show, audio book, poetry". Not very relevant for Eurovision songs, which we can confirm in figure A below. According to Spotify: "Values below 0.33 most likely represent music and other non-speech-like track". Duration (seconds) is also not very relevant, since songs can be a maximum of 3 minutes long, and contestants are going to want to use most of that. There is also liveness (values 0-1), which measures the presence of an audience on the track. This is not very relevant, since some of the Eurovision songs on spotify will be live recordings, and some will be studio versions, and from our perspective this is essentially random. Last one is Instrumentalness which measures whether a track contains no vocals. According to the documentation, Instrumentalness values above 0.5 are intended to represent instrumental tracks. This is not very relevant since the competition explicitly is a *Song* contest.
+
+```{r Figure A: Speechiness, duration, liveness, warning=F, echo=F}
+p1 <- all_entries %>% 
+  ggplot(aes(speechiness)) +
+  geom_histogram(bins=10) +
+  labs(title="Speechiness") +
+  xlab("") +
+  ylab("Number of songs")
+
+p2 <- all_entries %>% 
+  ggplot(aes(duration)) +
+  geom_histogram(bins=10) +
+  labs(title="Duration") +
+  xlab("") +
+  ylab("Number of songs")
+
+p3 <- all_entries %>% 
+  ggplot(aes(liveness)) +
+  geom_histogram(bins=10) +
+  labs(title="Liveness") +
+  xlab("") +
+  ylab("Number of songs")
+
+
+grid.arrange(p1, p2, p3, nrow=1, top="Figure A: Distribution of Speechiness, Duration, and liveness")
+```
+
+## Compile time
+```{r, echo=F}
+#For observing the total compile time
+global_stop <- Sys.time()
+```
+
+This entire report took `r round(global_stop - global_start, 1)` minutes to compile, which would be considered quite long by some. This is because of a lot of string heavy operations. The main time thieves are the genre scraping, transliteration and the api client, which has sleep built into it to avoid exceeding the rate limit. I have made attempts to minimise the amount of work demanded by some functions, but the operations still take time.
